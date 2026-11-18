@@ -1,0 +1,8 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/SecureImageUpload.Api/SecureImageUpload.Api.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/SecureImageUpload.Tests/SecureImageUpload.Tests.csproj" />
+  </Folder>
+</Solution>
