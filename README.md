@@ -1,20 +1,22 @@
 # SecureImageUpload
 
-ASP.NET Core (.NET 10) сервис загрузки изображений, который принимает **только PNG и JPEG (`.png`, `.jpg`, `.jpeg`)** и построен по принципу «не доверяй ни одному байту от клиента».
+An ASP.NET Core (.NET 10) upload endpoint that takes **PNG and JPEG only** (`.png`, `.jpg`, `.jpeg`). I built it around one rule: don't trust a single byte that comes from the client.
 
-Главная идея: файл клиента **никогда не сохраняется**. Он проходит независимые слои проверки, затем декодируется в пиксели, и на диск пишется новый файл, собранный сервером из этих пикселей. Всё, что не является пикселями (метаданные, комментарии, профили, «хвосты», полиглоты), физически не попадает в хранилище.
+The uploaded file is never stored. It goes through several independent checks, then gets decoded into pixels, and the server writes a brand-new file built from those pixels. Anything that isn't a pixel — metadata, comments, ICC profiles, trailing garbage, polyglot payloads — physically never reaches storage.
 
-## Запуск
+A quick note on why it's built this way: checking an extension and calling it a day is how most image-upload bugs happen. Validating the container helps, but the only thing that really removes embedded junk is re-encoding the image yourself.
+
+## Running it
 
 ```powershell
-# тесты (76 сценариев атак и легитимных загрузок)
+# tests: 85 scenarios, attacks and legitimate uploads mixed together
 dotnet test
 
-# локальный запуск
+# run locally
 $env:ASPNETCORE_ENVIRONMENT = "Development"
 dotnet run --project src/SecureImageUpload.Api
 
-# тестовый JWT для локальной проверки
+# local JWT for testing
 dotnet user-jwts create --project src/SecureImageUpload.Api --name alice
 ```
 
@@ -22,145 +24,145 @@ dotnet user-jwts create --project src/SecureImageUpload.Api --name alice
 curl -H "Authorization: Bearer <token>" -F "file=@photo.jpg;type=image/jpeg" http://localhost:5154/api/images
 ```
 
-## Swagger UI (ручное тестирование)
+## Swagger UI (manual testing)
 
-Swagger включён **только в окружении Development** — в production он не поднимается, чтобы не раскрывать описание API.
+Swagger runs **in Development only**. It describes the whole API surface, so there's no reason to expose it in production.
 
-1. Запустите `dotnet run --project src/SecureImageUpload.Api` (профиль `http` сам откроет браузер) и откройте <http://localhost:5154/swagger>.
-2. Получите токен: `dotnet user-jwts create --project src/SecureImageUpload.Api --name alice`.
-3. Нажмите **Authorize** и вставьте токен без слова `Bearer`.
-4. `POST /api/images` → **Try it out** → выберите файл → **Execute**. Полученный `id` подставьте в `GET /api/images/{id}`.
+1. `dotnet run --project src/SecureImageUpload.Api` (the `http` profile opens the browser for you) and go to <http://localhost:5154/swagger>.
+2. Get a token: `dotnet user-jwts create --project src/SecureImageUpload.Api --name alice`.
+3. Hit **Authorize** and paste the token without the `Bearer` prefix.
+4. `POST /api/images` → **Try it out** → pick a file → **Execute**. Take the returned `id` and use it with `GET /api/images/{id}`.
 
-OpenAPI-документ: <http://localhost:5154/openapi/v1.json>. Лимит — 10 загрузок в минуту на пользователя (`UploadsPerMinutePerUser`), при активном тестировании будет `429`.
+The OpenAPI document lives at <http://localhost:5154/openapi/v1.json>. Uploads are limited to 10 per minute per user (`UploadsPerMinutePerUser`), so if you test in a loop you'll start getting `429`.
 
 ## API
 
-| Метод | Путь | Описание |
+| Method | Path | What it does |
 |---|---|---|
-| `POST` | `/api/images` | `multipart/form-data`, ровно одна часть с именем `file`. Ответ `201` с `id`, `contentType`, `width`, `height`, `size`. |
-| `GET` | `/api/images/{id}` | Отдаёт изображение только его владельцу. Чужой или несуществующий `id` → `404`. |
+| `POST` | `/api/images` | `multipart/form-data` with exactly one part named `file`. Returns `201` with `id`, `contentType`, `width`, `height`, `size`. |
+| `GET` | `/api/images/{id}` | Returns the image, but only to the user who uploaded it. Someone else's `id`, or one that doesn't exist, gets `404`. |
 
-Оба эндпоинта требуют аутентификации (JWT Bearer). Ошибки клиенту намеренно грубые, чтобы проверки нельзя было использовать как оракул:
+Both endpoints require a JWT bearer token. Error codes are deliberately coarse, so that a client can't use the responses as an oracle:
 
-| HTTP | `error` | Когда |
+| HTTP | `error` | When |
 |---|---|---|
-| 400 | `bad_request` | не multipart, лишние части, нет файла, пустой файл |
-| 401 | — | нет или неверный токен |
-| 413 | `file_too_large` | превышен размер |
-| 415 | `unsupported_type` | имя, расширение, Content-Type или сигнатура не PNG/JPEG либо не согласованы |
-| 422 | `invalid_image` | битая структура, опасное содержимое, canary-токен, превышены размеры, ошибка декодера |
-| 429 | — | превышен лимит загрузок пользователя |
+| 400 | `bad_request` | not multipart, extra parts, no file, empty file |
+| 401 | — | missing or invalid token |
+| 413 | `file_too_large` | size limit exceeded |
+| 415 | `unsupported_type` | name, extension, Content-Type or magic bytes say it isn't PNG/JPEG, or they disagree |
+| 422 | `invalid_image` | broken structure, active content, canary token, dimension limits, decoder failure |
+| 429 | — | per-user upload limit hit |
 
-Точная причина отказа пишется только в серверный лог.
+The exact reason for a rejection only goes to the server log.
 
-## Слои защиты
+## The layers
 
-Загрузка должна пройти **все** слои. Каждый слой самостоятелен и не полагается на предыдущие.
+An upload has to pass **all** of them. Each one stands on its own and doesn't assume the previous one did its job.
 
-| # | Слой | Что делает | Где |
+| # | Layer | What it does | Where |
 |---|---|---|---|
-| 0 | Транспорт | Лимит тела запроса на уровне Kestrel/IIS, лимит заголовков, rate limit на пользователя, обязательная аутентификация | [Program.cs](src/SecureImageUpload.Api/Program.cs) |
-| 1 | Multipart | Собственный потоковый разбор: ровно одна часть `file`, лимиты на заголовки части, подсчёт реальных байтов (не доверяем `Content-Length`), отказ при расхождении `filename` и `filename*` | [MultipartFileReader.cs](src/SecureImageUpload.Api/Endpoints/MultipartFileReader.cs) |
-| 2 | Имя файла | Белый список расширений, NFKC-нормализация, запрет управляющих и невидимых символов, разделителей, `:` `;` `%`, двойных расширений, зарезервированных имён Windows | [FileNameValidator.cs](src/SecureImageUpload.Api/Validation/FileNameValidator.cs) |
-| 3 | Content-Type | Должен быть `image/png` или `image/jpeg` и совпадать с расширением | [ImageUploadService.cs](src/SecureImageUpload.Api/Services/ImageUploadService.cs) |
-| 4 | Сигнатура | Magic bytes должны быть PNG или JPEG и совпадать с расширением | [ImageFormat.cs](src/SecureImageUpload.Api/Validation/ImageFormat.cs) |
-| 5 | Структура | Полный обход контейнера без декодирования пикселей (см. ниже) | [PngStructureValidator.cs](src/SecureImageUpload.Api/Validation/PngStructureValidator.cs), [JpegStructureValidator.cs](src/SecureImageUpload.Api/Validation/JpegStructureValidator.cs) |
-| 6 | Байтовый сканер | Поиск активного содержимого, canary-токенов и внешних ссылок | [ThreatScanner.cs](src/SecureImageUpload.Api/Validation/ThreatScanner.cs) |
-| 7 | Пересборка (CDR) | Декодирование управляемым декодером, в котором зарегистрированы только PNG и JPEG; копирование пикселей в новое изображение; кодирование заново. Таймаут, лимит памяти, ограничение параллелизма | [ImageSanitizer.cs](src/SecureImageUpload.Api/Services/ImageSanitizer.cs) |
-| 8 | Контроль результата | Результат пересборки повторно проходит структурную проверку в строгом режиме | [ImageUploadService.cs](src/SecureImageUpload.Api/Services/ImageUploadService.cs) |
-| 9 | Хранение | Случайное имя (128 бит CSPRNG), расширение выбирает сервер, каталог на пользователя, `CreateNew`, проверка, что путь внутри корня | [ImageStorage.cs](src/SecureImageUpload.Api/Services/ImageStorage.cs) |
-| 10 | Выдача | `nosniff`, `Content-Security-Policy: default-src 'none'; sandbox`, `Cross-Origin-Resource-Policy`, тип берётся из сервера | [ImageEndpoints.cs](src/SecureImageUpload.Api/Endpoints/ImageEndpoints.cs) |
+| 0 | Transport | Body size cap at the Kestrel/IIS level, header limits, per-user rate limit, mandatory authentication | [Program.cs](src/SecureImageUpload.Api/Program.cs) |
+| 1 | Multipart | Hand-written streaming parser: exactly one `file` part, limits on part headers, real byte counting (no trust in `Content-Length`), rejects mismatched `filename` / `filename*` | [MultipartFileReader.cs](src/SecureImageUpload.Api/Endpoints/MultipartFileReader.cs) |
+| 2 | File name | Extension allowlist, NFKC normalization, no control or invisible characters, separators, `:` `;` `%`, double extensions, reserved Windows names | [FileNameValidator.cs](src/SecureImageUpload.Api/Validation/FileNameValidator.cs) |
+| 3 | Content-Type | Must be `image/png` or `image/jpeg` and must match the extension | [ImageUploadService.cs](src/SecureImageUpload.Api/Services/ImageUploadService.cs) |
+| 4 | Magic bytes | Signature must be PNG or JPEG and must match the extension | [ImageFormat.cs](src/SecureImageUpload.Api/Validation/ImageFormat.cs) |
+| 5 | Structure | Full container walk without decoding pixels (details below) | [PngStructureValidator.cs](src/SecureImageUpload.Api/Validation/PngStructureValidator.cs), [JpegStructureValidator.cs](src/SecureImageUpload.Api/Validation/JpegStructureValidator.cs) |
+| 6 | Byte scanner | Looks for active content, canary tokens and external URLs | [ThreatScanner.cs](src/SecureImageUpload.Api/Validation/ThreatScanner.cs) |
+| 7 | Rebuild (CDR) | Decode with a controlled decoder where only PNG and JPEG are registered; copy pixels into a new image; encode again. With a timeout, memory cap and concurrency limit | [ImageSanitizer.cs](src/SecureImageUpload.Api/Services/ImageSanitizer.cs) |
+| 8 | Result check | The rebuilt image is checked against the structural rules again, in strict mode | [ImageUploadService.cs](src/SecureImageUpload.Api/Services/ImageUploadService.cs) |
+| 9 | Storage | Random name (128-bit CSPRNG), server picks the extension, per-user directory, `CreateNew`, path verified to stay inside the root | [ImageStorage.cs](src/SecureImageUpload.Api/Services/ImageStorage.cs) |
+| 10 | Delivery | `nosniff`, `Content-Security-Policy: default-src 'none'; sandbox`, `Cross-Origin-Resource-Policy`, type taken from the server | [ImageEndpoints.cs](src/SecureImageUpload.Api/Endpoints/ImageEndpoints.cs) |
 
-### Структурная проверка (слой 5)
+### Structural check (layer 5)
 
-**PNG:** длина и CRC каждого чанка; `IHDR` первым и единственным; допустимые сочетания глубины и типа цвета; `IDAT` подряд; `PLTE` до `IDAT`; обязательный `IEND`; запрет APNG (`acTL`, `fcTL`, `fdAT`) и неизвестных критических чанков; `zTXt`/`iTXt`/`iCCP` распаковываются с лимитом 2 МБ (защита от zip-бомбы) и передаются сканеру.
+**PNG:** length and CRC for every chunk; `IHDR` first and only once; valid bit-depth / color-type combinations; `IDAT` chunks in sequence; `PLTE` before `IDAT`; `IEND` required; APNG (`acTL`, `fcTL`, `fdAT`) and unknown critical chunks rejected; `zTXt` / `iTXt` / `iCCP` decompressed with a 2 MB cap (zip-bomb guard) and handed to the scanner.
 
-**JPEG:** только SOF0/SOF1/SOF2 (baseline, extended, progressive), 8 бит, 1/3/4 компонента; ровно один кадр; не более 64 сканов (защита от CPU-DoS прогрессивными файлами); запрет lossless, иерархических и арифметических вариантов, повторного SOI, DNL; обязательный EOI.
+**JPEG:** only SOF0/SOF1/SOF2 (baseline, extended, progressive), 8-bit, 1/3/4 components; exactly one frame; at most 64 scans (keeps a progressive file from burning CPU); lossless, hierarchical and arithmetic variants rejected, as are duplicate SOI and DNL; `EOI` required.
 
-**Оба формата:** размеры читаются из заголовка и сверяются с лимитами **до** декодирования; любые байты после `IEND` в PNG — всегда отказ. Данные после `EOI` в JPEG по умолчанию допускаются (так устроены фото с телефонов: Ultra HDR, Samsung, motion photo), проверяются по сигнатурам и удаляются пересборкой; `RejectTrailingData = true` включает отказ.
+**Both:** dimensions are read from the header and compared against the limits **before** decoding. In PNG, any byte after `IEND` is always a rejection. In JPEG, data after `EOI` is allowed by default, because that's how phone photos work (Samsung trailers, Android Ultra HDR gain maps, motion photos). It gets checked for known signatures and removed by the rebuild. Set `RejectTrailingData = true` if you'd rather reject those files.
 
-## Методы обхода и чем они закрыты
+## Attacks this was tested against
 
-| Атака | Защита |
+| Attack | What stops it |
 |---|---|
-| `shell.php`, `image.svg`, `image.gif` | белый список расширений (слой 2) |
-| `image.png.exe`, `image.jpg.bak`, `image.pngx` | имя обязано **заканчиваться** на `.png`, `.jpg` или `.jpeg`: проверяется последний сегмент после последней точки |
-| `shell.php.jpg`, `shell.pHp5.png` | запрет опасных сегментов в любом месте имени, без учёта регистра |
-| `shell.php%00.jpg`, `shell.php\0.jpg` | запрет `%` и управляющих символов |
-| `a.asp;.jpg`, `a.jpg::$DATA`, `a.jpg.`, `a.jpg ` | запрет `;`, `:`, завершающих точек и пробелов |
-| `../../a.jpg`, `..\a.jpg` | запрет разделителей; имя клиента вообще не используется в пути |
-| RTLO (`gpj.exe`), zero-width, fullwidth `．ｐｈｐ` | запрет категории Unicode Format, NFKC-нормализация |
-| Подмена `Content-Type` | сверка с расширением и с сигнатурой |
-| `GIF89a<?php …`, файл только из magic bytes | сигнатура + полный структурный обход |
-| PNG-содержимое с именем `.jpg` и наоборот | расширение, Content-Type, сигнатура и декодер должны совпасть |
-| Полиглоты: PNG+ZIP, JPEG+PHAR, JPEG+HTML, дописанный хвост | PNG: отказ по любым данным после `IEND`. JPEG: хвост проверяется по сигнатурам (PHP, HTML, скрипты, canary-домены) и никогда не сохраняется — на диск пишется только пересобранное изображение |
-| PHP/JS в EXIF, XMP, COM, `tEXt`, ICC | сканер (включая UTF-16 и сжатые `zTXt`/`iTXt`) + полное удаление метаданных |
-| XXE в XMP (`<!ENTITY`) | сканер; XML нигде не разбирается |
-| Pixel flood / decompression bomb | размеры из заголовка до декодирования, лимит пикселей, лимит памяти аллокатора, таймаут |
-| Zip-бомба в `zTXt`/`iCCP` | распаковка с жёстким лимитом |
-| JPEG с тысячами сканов, APNG с тысячами кадров | лимит сканов; APNG запрещён; `MaxFrames = 1` |
-| Эксплойт в редком кодеке (TIFF, WebP, BMP…) | в декодере зарегистрированы только PNG и JPEG; декодер полностью управляемый (без нативного кода) |
-| Несколько файлов, лишние поля, огромные заголовки частей | ровно одна часть, лимиты `MultipartReader` |
-| Ложный `Content-Length`, chunked-тело | лимит сервера + собственный подсчёт байтов |
-| Перезапись чужого файла, угадывание имён | случайный `id`, `FileMode.CreateNew`, каталог на пользователя |
-| IDOR при скачивании | путь строится из хэша идентификатора пользователя; чужой `id` не находится |
-| Stored XSS через content sniffing | `nosniff`, CSP `sandbox`, фиксированный `Content-Type` |
-| Log injection через имя файла | в лог попадают только буквы, цифры и `. - _` |
-| CSRF | Bearer-токен вместо cookie |
-| Массовая загрузка, исчерпание CPU/RAM | rate limit на пользователя, семафор на декодирование, таймаут |
+| `shell.php`, `image.svg`, `image.gif` | extension allowlist (layer 2) |
+| `image.png.exe`, `image.jpg.bak`, `image.pngx` | the name must **end** with `.png`, `.jpg` or `.jpeg`: only the last segment after the final dot is checked |
+| `shell.php.jpg`, `shell.pHp5.png` | dangerous segments are banned anywhere in the name, case-insensitive |
+| `shell.php%00.jpg`, `shell.php\0.jpg` | `%` and control characters banned |
+| `a.asp;.jpg`, `a.jpg::$DATA`, `a.jpg.`, `a.jpg ` | `;`, `:`, trailing dots and spaces banned |
+| `../../a.jpg`, `..\a.jpg` | separators banned; the client's name is never used in a path anyway |
+| RTLO (`gpj.exe`), zero-width chars, fullwidth `．ｐｈｐ` | Unicode Format category banned, NFKC normalization applied |
+| Content-Type spoofing | cross-checked against the extension and the signature |
+| `GIF89a<?php …`, a file that's only magic bytes | signature plus a full structural walk |
+| PNG content named `.jpg` and vice versa | extension, Content-Type, signature and decoder all have to agree |
+| Polyglots: PNG+ZIP, JPEG+PHAR, JPEG+HTML, appended trailers | PNG: anything after `IEND` is rejected. JPEG: the tail is scanned for known signatures (PHP, HTML, scripts, canary domains) and never stored — only the rebuilt image is written |
+| PHP/JS in EXIF, XMP, COM, `tEXt`, ICC | the scanner reads it (including UTF-16 and compressed `zTXt` / `iTXt`), and the rebuild drops all metadata |
+| XXE in XMP (`<!ENTITY`) | caught by the scanner; XML is never parsed anywhere |
+| Pixel flood / decompression bomb | header dimensions checked before decoding, pixel cap, decoder memory cap, timeout |
+| Zip bomb in `zTXt` / `iCCP` | decompression with a hard cap |
+| JPEG with thousands of scans, APNG with thousands of frames | scan limit; APNG banned; `MaxFrames = 1` |
+| Exploit in an exotic codec (TIFF, WebP, BMP…) | only PNG and JPEG are registered in the decoder, and the decoder is fully managed (no native code) |
+| Multiple files, extra fields, huge part headers | exactly one part, `MultipartReader` limits |
+| Fake `Content-Length`, chunked body | server limit plus the parser's own byte count |
+| Overwriting someone else's file, guessing names | random `id`, `FileMode.CreateNew`, per-user directory |
+| IDOR on download | the path is derived from a hash of the user id, so another user's `id` simply doesn't resolve |
+| Stored XSS via content sniffing | `nosniff`, CSP `sandbox`, fixed `Content-Type` |
+| Log injection through the file name | only letters, digits and `. - _` reach the log |
+| CSRF | bearer token instead of a cookie |
+| Upload floods, CPU/RAM exhaustion | per-user rate limit, decode semaphore, timeout |
 
-## Canary-токены и внешние ссылки
+## Canary tokens and external URLs
 
-Canary-токен в изображении — это URL, DNS-имя или UNC-путь в метаданных, который «звонит домой», когда файл открывают или обрабатывают. Так атакующий узнаёт, что файл просмотрен, с какого IP, а через UNC-путь на Windows может получить NTLM-хэш.
+A canary token is a URL, DNS name or UNC path hidden in image metadata that "calls home" when the file is opened or processed. The attacker learns that the file was viewed and from which IP, and on Windows a UNC path can leak an NTLM hash.
 
-Что делает сервис:
+What the service does about it:
 
-1. **Известные домены** (canarytokens.com/.org/.net, interact.sh, oast.\*, oastify.com, burpcollaborator.net, dnslog.cn, webhook.site, requestbin, ngrok и др.) ищутся во всём файле, без учёта регистра, в ASCII и UTF-16 → отказ `CanaryToken` и событие безопасности в логе. Список расширяется настройкой `ExtraCanaryDomains`.
-2. **Любые внешние ссылки** в метаданных (`http(s)://`, `ftp://`, `file://`, `smb://`, `ldap://`, `\\host\share`, IP-адреса) извлекаются и логируются. С `RejectExternalUrls = true` такие файлы отклоняются. Идентификаторы пространств имён XMP (`ns.adobe.com`, `www.w3.org` и т. п.) в белом списке.
-3. **Пересборка удаляет все метаданные** независимо от результата сканирования — в сохранённом файле ссылок нет.
-4. Сервис **сам никуда не ходит**: ни один URL из файла не разрешается и не запрашивается.
+1. **Known domains** (canarytokens.com/.org/.net, interact.sh, oast.\*, oastify.com, burpcollaborator.net, dnslog.cn, webhook.site, requestbin, ngrok and others) are searched for across the whole file, case-insensitive, in both ASCII and UTF-16. A hit means a `CanaryToken` rejection and a security event in the log. The list can be extended with `ExtraCanaryDomains`.
+2. **Any external URL** in metadata (`http(s)://`, `ftp://`, `file://`, `smb://`, `ldap://`, `\\host\share`, IP addresses) is extracted and logged. With `RejectExternalUrls = true` those uploads are rejected. XMP namespace identifiers (`ns.adobe.com`, `www.w3.org` and similar) are allowlisted.
+3. The rebuild **removes all metadata** regardless of what the scan found, so the stored file contains no links.
+4. The service **never makes an outbound request.** No URL from a file is ever resolved or fetched.
 
-Ограничение: токен на собственном домене атакующего по списку не определить. Он будет виден только как «внешняя ссылка» (пункт 2). Реальная защита — пункты 3 и 4, сканер нужен для обнаружения и оповещения.
+One limitation worth being honest about: a token on the attacker's own domain won't match any list. It'll show up as an "external URL" (point 2). The real protection is points 3 and 4 — the scanner is for detection and alerting.
 
-## Настройки (`Upload` в appsettings)
+## Settings (`Upload` section in appsettings)
 
-| Параметр | По умолчанию | Назначение |
+| Setting | Default | Purpose |
 |---|---|---|
-| `StorageRoot` | — (обязателен) | Каталог хранения. Должен быть вне веб-корня; при старте это проверяется |
-| `MaxFileBytes` | 10 МБ | Максимальный размер файла |
-| `MaxWidth` / `MaxHeight` | 8000 | Максимальные стороны |
-| `MaxPixels` | 40 000 000 | Максимум пикселей. Декодирование стоит около 8 байт RAM на пиксель |
-| `MaxConcurrentDecodes` | 2 | Одновременных декодирований |
-| `ProcessingTimeoutSeconds` | 15 | Таймаут обработки одного файла |
-| `DecoderMemoryLimitMegabytes` | 512 | Лимит одной аллокации декодера |
-| `JpegQuality` | 90 | Качество перекодирования JPEG |
+| `StorageRoot` | — (required) | Storage directory. Must be outside the web root; checked at startup |
+| `MaxFileBytes` | 10 MB | Maximum file size |
+| `MaxWidth` / `MaxHeight` | 8000 | Maximum dimensions |
+| `MaxPixels` | 40,000,000 | Pixel cap. Decoding costs roughly 8 bytes of RAM per pixel |
+| `MaxConcurrentDecodes` | 2 | Concurrent decodes |
+| `ProcessingTimeoutSeconds` | 15 | Per-file processing timeout |
+| `DecoderMemoryLimitMegabytes` | 512 | Single decoder allocation cap |
+| `JpegQuality` | 90 | JPEG re-encode quality |
 | `UploadsPerMinutePerUser` | 10 | Rate limit |
-| `RejectTrailingData` | `false` | Только JPEG: отказ при данных после `EOI`. При `true` отклоняются настоящие фото с телефонов |
-| `RejectExternalUrls` | `false` | Отказ при внешних ссылках в метаданных |
-| `ExtraCanaryDomains` | `[]` | Дополнительные блокируемые домены |
+| `RejectTrailingData` | `false` | JPEG only: reject data after `EOI`. Turning it on rejects real phone photos |
+| `RejectExternalUrls` | `false` | Reject images whose metadata references external URLs |
+| `ExtraCanaryDomains` | `[]` | Additional domains to block |
 
-JWT настраивается стандартно в `Authentication:Schemes:Bearer`.
+JWT is configured the standard way under `Authentication:Schemes:Bearer`.
 
-## События в логах
+## Log events
 
-| EventId | Уровень | Значение |
+| EventId | Level | Meaning |
 |---|---|---|
-| 4001 `UploadSecurityEvent` | Warning | Признак атаки: несовпадение типа, хвост после конца файла, активное содержимое, canary-токен, внешняя ссылка (при строгой политике). Заводить алерт в SIEM |
-| 4002 `UploadRejected` | Information | Обычный отказ: битый файл, размер, имя |
+| 4001 `UploadSecurityEvent` | Warning | Looks like an attack: type mismatch, trailing data, active content, canary token, external URL (under the strict policy). Worth an alert in your SIEM |
+| 4002 `UploadRejected` | Information | An ordinary rejection: broken file, size, name |
 
-В записи: причина, детали, пользователь, очищенное имя файла, размер, SHA-256 оригинала (сам файл не сохраняется).
+Each entry carries the reason, details, user, sanitized file name, size and the SHA-256 of the original. The original itself isn't stored anywhere.
 
-## Что код не закрывает и что нужно сделать при внедрении
+## What this doesn't solve
 
-- **Лицензия ImageSharp.** Используется SixLabors.ImageSharp 4.x. Debug-сборка работает без ключа, **Release-сборка требует лицензию Six Labors** (коммерческую для компании). Библиотека выбрана потому, что декодер полностью управляемый. Если лицензия не подходит, заменяется один класс `ImageSanitizer` (например, на SkiaSharp под MIT, но это нативный код и другой профиль риска).
-- **Фото с телефонов и хвост после EOI.** Samsung, Android Ultra HDR и motion photo дописывают данные после конца JPEG, поэтому по умолчанию хвост допускается и удаляется пересборкой. HDR-карта и видео motion photo при этом теряются — сохраняется обычное SDR-изображение. Строгий режим (`RejectTrailingData = true`) такие фото отклоняет.
-- **Лимиты размеров.** По умолчанию 10 МБ, 8000 px по стороне и 40 Мп. Снимки в режиме 50/200 Мп в них не пройдут.
-- **Стеганография.** PNG перекодируется без потерь, значит данные, спрятанные в младших битах пикселей, сохраняются. JPEG-перекодирование их в основном разрушает. Гарантированно убрать стеганографию можно только изменением пикселей (ресайз, шум).
-- **Полезная нагрузка в самих пикселях.** Известны изображения, подобранные так, чтобы после перекодирования в сжатых данных получилась строка вроде PHP-кода. Поэтому каталог хранения нельзя отдавать через веб-сервер с исполнением скриптов и нельзя `include`-ить файлы из него. Сервис хранит вне веб-корня и отдаёт только через эндпоинт.
-- **Цвет.** ICC-профиль удаляется, поэтому фото в Display P3 / Adobe RGB будут выглядеть чуть менее насыщенно. Ориентация EXIF перед удалением применяется к пикселям.
-- **Терпимость декодера.** PNG, в котором строк меньше, чем заявлено в заголовке, декодер дополняет, а не отклоняет. Результат — чистое изображение в пределах лимитов (есть тест).
-- **Антивирус.** Не подключён. Если требуется политикой, добавляется между слоями 6 и 7 (ClamAV, ICAP, AMSI).
-- **Rate limit в памяти процесса.** При нескольких экземплярах лимит считается на каждый отдельно; общий лимит нужно ставить на балансировщике или API-шлюзе.
-- **Reverse proxy.** Лимит размера тела и таймауты надо продублировать на nginx/IIS/WAF, иначе большие тела будут доходить до приложения.
-- **Домен выдачи.** Для пользовательского контента лучше отдельный домен без cookie основного приложения.
-- **Обновления.** Декодер — главная поверхность атаки; следите за security-релизами ImageSharp.
+- **ImageSharp licensing.** This uses SixLabors.ImageSharp 4.x. Debug builds run without a key, but a **Release build needs a Six Labors license** (commercial one for a company). I picked it because the decoder is fully managed. If the license doesn't work for you, there's one class to replace — `ImageSanitizer` (SkiaSharp under MIT is an option, but it's native code with a different risk profile).
+- **Phone photos and data after EOI.** Samsung, Android Ultra HDR and motion photos append data after the end of the JPEG, so by default that data is allowed and removed by the rebuild. The HDR gain map and the motion video are lost in the process — what you get back is a plain SDR image. Strict mode (`RejectTrailingData = true`) rejects these files instead.
+- **Size limits.** The defaults are 10 MB, 8000 px per side and 40 MP. A 50 MP or 200 MP shot won't get through.
+- **Steganography.** PNG is re-encoded losslessly, so data hidden in the low bits of the pixels survives. JPEG re-encoding mostly destroys it. If you need it gone for certain, you have to change the pixels: resize or add noise.
+- **Payloads inside the pixels themselves.** There are known images crafted so that the compressed output of a re-encode contains something like PHP code. That's why the storage directory must never be served by a web server that executes scripts, and why nothing should ever `include` files from it. This service keeps storage outside the web root and serves files only through the endpoint.
+- **Color.** The ICC profile is dropped, so photos in Display P3 or Adobe RGB will look slightly less saturated. EXIF orientation is applied to the pixels before it's removed.
+- **Decoder leniency.** If a PNG declares more rows than it contains, the decoder pads the image instead of rejecting it. The result is still a clean image within the limits (there's a test for it).
+- **Antivirus.** Not wired in. If policy requires it, it goes between layers 6 and 7 (ClamAV, ICAP, AMSI).
+- **Rate limiting is in-process.** With several instances each one counts separately. A global limit belongs on the load balancer or API gateway.
+- **Reverse proxy.** Body size limits and timeouts need to be repeated in nginx / IIS / your WAF, otherwise large bodies still reach the app.
+- **Serving domain.** User content is better served from a separate domain with no cookies from the main application.
+- **Updates.** The decoder is the main attack surface here. Keep an eye on ImageSharp security releases.
